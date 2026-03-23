@@ -1,7 +1,7 @@
-import { useState, useEffect, useCallback, useRef } from "react";
+import { useState, useEffect, useCallback } from "react";
 import {
   LineChart, Line, XAxis, YAxis, Tooltip, ResponsiveContainer,
-  ReferenceLine, AreaChart, Area, BarChart, Bar, ComposedChart
+  ReferenceLine, AreaChart, Area, ComposedChart, Bar
 } from "recharts";
 
 // ═══════════════════════════════════════════════════════════════════
@@ -12,9 +12,7 @@ import {
 const mean = arr => arr.reduce((a, b) => a + b, 0) / arr.length;
 const sum = arr => arr.reduce((a, b) => a + b, 0);
 const stdDev = arr => { const m = mean(arr); return Math.sqrt(arr.reduce((a, v) => a + (v - m) ** 2, 0) / arr.length); };
-const variance = arr => { const m = mean(arr); return arr.reduce((a, v) => a + (v - m) ** 2, 0) / arr.length; };
-const cov = (a, b) => { const ma = mean(a), mb = mean(b); return mean(a.map((v, i) => (v - ma) * (b[i] - mb))); };
-const corr = (a, b) => cov(a, b) / (stdDev(a) * stdDev(b));
+const calcVariance = arr => { const m = mean(arr); return arr.reduce((a, v) => a + (v - m) ** 2, 0) / arr.length; };
 const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
 
 function boxMuller() {
@@ -31,7 +29,7 @@ const simpleReturns = prices => prices.slice(1).map((p, i) => (p - prices[i]) / 
 // --- GARCH(1,1) Parameter Estimation (MLE approximation via moment matching) ---
 function fitGARCH(returns) {
   const r2 = returns.map(r => r * r);
-  const unconditionalVar = variance(returns);
+  const unconditionalVar = calcVariance(returns);
   // Method of moments initialisation
   const alpha0_init = unconditionalVar * 0.1;
   const alpha1_init = 0.08;
@@ -257,8 +255,10 @@ function riskMetrics(returns, prices, rf = 0.0525 / 252) {
   const calmar = mdd > 0 ? annRet / mdd : 0;
   const skew = (() => { const m = mean(returns), s = stdDev(returns); return mean(returns.map(r => ((r-m)/s)**3)); })();
   const kurt = (() => { const m = mean(returns), s = stdDev(returns); return mean(returns.map(r => ((r-m)/s)**4)) - 3; })();
-  const var95 = [...returns].sort((a,b)=>a-b)[Math.floor(returns.length * 0.05)];
-  const cvar95 = mean([...returns].sort((a,b)=>a-b).slice(0, Math.floor(returns.length * 0.05)));
+  const sorted = [...returns].sort((a,b)=>a-b);
+  const tailN = Math.max(1, Math.floor(returns.length * 0.05));
+  const var95 = sorted[tailN];
+  const cvar95 = mean(sorted.slice(0, tailN));
   return { sharpe, sortino, calmar, mdd, skew, kurt, var95, cvar95, annVol: stdDev(returns)*Math.sqrt(252), annRet };
 }
 
@@ -322,7 +322,7 @@ function calibratedSignal(returns, prices, hmm, garch, rsiVals, bbands) {
 
   // Kelly fraction (half-Kelly for safety)
   const mu = mean(returns) * 252;
-  const sig2 = variance(returns) * 252;
+  const sig2 = calcVariance(returns) * 252;
   const kelly = clamp(mu / (sig2 + 1e-10) * 0.5, -1, 2);
 
   return {
@@ -333,49 +333,237 @@ function calibratedSignal(returns, prices, hmm, garch, rsiVals, bbands) {
 }
 
 // ═══════════════════════════════════════════════════════════════════
+//  BLACK-SCHOLES OPTIONS ENGINE
+// ═══════════════════════════════════════════════════════════════════
+
+// Standard normal CDF via Horner's approximation
+function normCDF(x) {
+  const a1=0.254829592,a2=-0.284496736,a3=1.421413741,a4=-1.453152027,a5=1.061405429,p=0.3275911;
+  const sign = x < 0 ? -1 : 1;
+  x = Math.abs(x) / Math.sqrt(2);
+  const t = 1 / (1 + p * x);
+  const y = 1 - (((((a5*t+a4)*t)+a3)*t+a2)*t+a1)*t*Math.exp(-x*x);
+  return 0.5 * (1 + sign * y);
+}
+function normPDF(x) { return Math.exp(-0.5*x*x) / Math.sqrt(2*Math.PI); }
+
+function blackScholes(S, K, T, r, sigma, type = "call") {
+  if (T <= 0) {
+    const intrinsic = type === "call" ? Math.max(S - K, 0) : Math.max(K - S, 0);
+    return { price: intrinsic, delta: type==="call"?(S>K?1:0):(S<K?-1:0), gamma:0, theta:0, vega:0, rho:0, d1:0, d2:0 };
+  }
+  const d1 = (Math.log(S/K) + (r + 0.5*sigma*sigma)*T) / (sigma*Math.sqrt(T));
+  const d2 = d1 - sigma*Math.sqrt(T);
+  const df = Math.exp(-r*T);
+  let price, delta, rho;
+  if (type === "call") {
+    price = S*normCDF(d1) - K*df*normCDF(d2);
+    delta = normCDF(d1);
+    rho   = K*T*df*normCDF(d2) / 100;
+  } else {
+    price = K*df*normCDF(-d2) - S*normCDF(-d1);
+    delta = normCDF(d1) - 1;
+    rho   = -K*T*df*normCDF(-d2) / 100;
+  }
+  const gamma = normPDF(d1) / (S*sigma*Math.sqrt(T));
+  const vega  = S*normPDF(d1)*Math.sqrt(T) / 100;
+  const theta = type === "call"
+    ? (-S*normPDF(d1)*sigma/(2*Math.sqrt(T)) - r*K*df*normCDF(d2)) / 365
+    : (-S*normPDF(d1)*sigma/(2*Math.sqrt(T)) + r*K*df*normCDF(-d2)) / 365;
+  return { price, delta, gamma, theta, vega, rho, d1, d2, iv: sigma };
+}
+
+// Build a full options chain around ATM
+function buildOptionsChain(S, sigma, r = 0.0525, daysToExpiry = [7, 14, 30, 60, 90]) {
+  const strikes = [-0.15,-0.10,-0.05,-0.02,0,0.02,0.05,0.10,0.15].map(pct => Math.round(S*(1+pct)/5)*5);
+  return daysToExpiry.map(days => ({
+    expiry: days,
+    strikes: strikes.map(K => ({
+      K,
+      call: blackScholes(S, K, days/365, r, sigma, "call"),
+      put:  blackScholes(S, K, days/365, r, sigma, "put"),
+      moneyness: ((S-K)/K*100).toFixed(1),
+    }))
+  }));
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  PORTFOLIO BACKTESTER
+// ═══════════════════════════════════════════════════════════════════
+
+function runBacktest(prices, returns, signal) {
+  // Momentum-crossover strategy: go long when 10D EMA > 30D EMA, flat otherwise
+  const ema10 = ema(prices, 10);
+  const ema30 = ema(prices, 30);
+  const startIdx = 30; // align
+  const equity = [10000];
+  const trades = [];
+  const benchmarkEq = [10000];
+  let position = 0; // 0=flat, 1=long, -1=short
+  let entryPrice = 0, entryIdx = 0;
+  const dailyPnL = [];
+  const drawdowns = [];
+  let peakEq = 10000;
+
+  for (let i = startIdx; i < prices.length - 1; i++) {
+    const fastE = ema10[i], slowE = ema30[i];
+    const prevFast = ema10[i-1], prevSlow = ema30[i-1];
+    const ret = returns[i] || 0;
+    const prev = equity[equity.length - 1];
+    const bPrev = benchmarkEq[benchmarkEq.length - 1];
+
+    // Signal: golden cross = long, death cross = flat
+    let signal = 0;
+    if (fastE > slowE) signal = 1;
+    else if (fastE < slowE) signal = 0;
+
+    // Execute trade on cross
+    if (signal !== position) {
+      if (position !== 0) trades.push({ type: position > 0 ? "SELL" : "COVER", price: prices[i], idx: i, pnl: position*(prices[i]-entryPrice) });
+      if (signal !== 0) { trades.push({ type: signal > 0 ? "BUY" : "SHORT", price: prices[i], idx: i }); entryPrice = prices[i]; entryIdx = i; }
+      position = signal;
+    }
+
+    const stratRet = position * ret;
+    const newEq = prev * (1 + stratRet);
+    equity.push(newEq);
+    benchmarkEq.push(bPrev * (1 + ret));
+    dailyPnL.push(stratRet);
+    peakEq = Math.max(peakEq, newEq);
+    drawdowns.push((peakEq - newEq) / peakEq);
+  }
+
+  const totalReturn = (equity[equity.length-1] - 10000) / 10000;
+  const bmReturn    = (benchmarkEq[benchmarkEq.length-1] - 10000) / 10000;
+  const annRet = mean(dailyPnL) * 252;
+  const annVol = stdDev(dailyPnL) * Math.sqrt(252);
+  const sharpe = annVol > 0 ? annRet / annVol : 0;
+  const maxDD   = Math.max(...drawdowns);
+  const winRate = trades.filter(t => t.pnl > 0).length / Math.max(trades.filter(t => t.pnl).length, 1);
+  const alpha   = totalReturn - bmReturn;
+
+  return {
+    equity: equity.map((v,i) => ({ day: i, value: +v.toFixed(2), benchmark: +benchmarkEq[i]?.toFixed(2) })),
+    trades, totalReturn, bmReturn, sharpe, maxDD, winRate, alpha, annRet, annVol,
+    nTrades: trades.filter(t=>t.pnl).length,
+  };
+}
+
+// ═══════════════════════════════════════════════════════════════════
 //  DATA FETCHING VIA CLAUDE API (web search for real prices)
 // ═══════════════════════════════════════════════════════════════════
 
-async function fetchRealStockData(ticker) {
-  const prompt = `You are a financial data API. Search the web for the most recent 120 trading days of daily closing prices for ${ticker} stock.
+// ─── Yahoo Finance proxy helper (fast, free, no auth) ───────────────
+const YAHOO_PROXY = "https://query1.finance.yahoo.com/v8/finance/chart/";
+const YAHOO_META  = "https://query2.finance.yahoo.com/v10/finance/quoteSummary/";
 
-Return ONLY a valid JSON object with this exact structure, no markdown, no explanation:
-{
-  "ticker": "${ticker}",
-  "name": "Full company name",
-  "sector": "Sector name",
-  "currentPrice": 123.45,
-  "prices": [oldest_price, ..., newest_price],
-  "dates": ["Jan 1", ..., "latest date"],
-  "currency": "USD"
+const SECTOR_MAP = {
+  AAPL:"Technology", NVDA:"Semiconductors", TSLA:"EV/Energy",
+  MSFT:"Technology", AMZN:"E-Commerce/Cloud", META:"Social Media",
+  SPY:"Index ETF", "BTC-USD":"Crypto",
+};
+const NAME_MAP = {
+  AAPL:"Apple Inc.", NVDA:"NVIDIA Corp.", TSLA:"Tesla Inc.",
+  MSFT:"Microsoft Corp.", AMZN:"Amazon.com Inc.", META:"Meta Platforms",
+  SPY:"SPDR S&P 500 ETF", "BTC-USD":"Bitcoin USD",
+};
+const PEERS_MAP = {
+  AAPL:["MSFT","GOOGL","META"], NVDA:["AMD","INTC","AVGO"],
+  TSLA:["RIVN","F","GM"], MSFT:["AAPL","GOOGL","ORCL"],
+  AMZN:["MSFT","GOOGL","BABA"], META:["SNAP","PINS","GOOGL"],
+  SPY:["QQQ","IWM","DIA"], "BTC-USD":["ETH-USD","SOL-USD","BNB-USD"],
+};
+
+async function fetchYahooChart(sym, days = 90) {
+  const url = `${YAHOO_PROXY}${encodeURIComponent(sym)}?interval=1d&range=${days}d&includePrePost=false`;
+  const res = await fetch(url, { headers: { "Accept": "application/json" } });
+  if (!res.ok) throw new Error(`Yahoo chart error ${res.status} for ${sym}`);
+  const j = await res.json();
+  const result = j?.chart?.result?.[0];
+  if (!result) throw new Error(`No chart data for ${sym}`);
+  const timestamps = result.timestamp || [];
+  const closes = result.indicators?.quote?.[0]?.close || [];
+  const meta = result.meta || {};
+  // Filter out null closes
+  const pairs = timestamps.map((t, i) => ({ t, c: closes[i] })).filter(p => p.c != null);
+  const prices = pairs.map(p => +p.c.toFixed(4));
+  const dates  = pairs.map(p => {
+    const d = new Date(p.t * 1000);
+    return d.toLocaleDateString("en-US", { month: "short", day: "numeric" });
+  });
+  return {
+    ticker: sym, prices, dates,
+    currentPrice: meta.regularMarketPrice || prices[prices.length - 1],
+    name: NAME_MAP[sym] || meta.longName || sym,
+    sector: SECTOR_MAP[sym] || "Equity",
+    marketCap: meta.marketCap,
+    currency: meta.currency || "USD",
+  };
 }
 
-Rules:
-- prices array must have exactly 120 numbers (daily closes, oldest first)
-- dates array must have exactly 120 strings
-- Use real recent market data from web search
-- currentPrice should be the latest close
-- All prices must be realistic numbers for ${ticker}`;
+async function fetchRealStockData(ticker) {
+  return fetchYahooChart(ticker, 90);
+}
 
-  const response = await fetch("https://api.anthropic.com/v1/messages", {
+// ─── Peer quote fetch (Yahoo Finance, parallel) ─────────────────────
+async function fetchPeerComparison(ticker) {
+  const peerTickers = [ticker, ...(PEERS_MAP[ticker] || ["SPY"])];
+  const results = await Promise.all(peerTickers.map(async sym => {
+    try {
+      // Fetch summary + price in one call
+      const url = `${YAHOO_META}${encodeURIComponent(sym)}?modules=summaryDetail,defaultKeyStatistics,financialData,price`;
+      const res = await fetch(url, { headers: { "Accept": "application/json" } });
+      if (!res.ok) return null;
+      const j = await res.json();
+      const r = j?.quoteSummary?.result?.[0];
+      if (!r) return null;
+      const sd = r.summaryDetail || {}, fs = r.financialData || {}, ks = r.defaultKeyStatistics || {}, pr = r.price || {};
+      return {
+        ticker: sym,
+        name: NAME_MAP[sym] || pr.longName || sym,
+        price: pr.regularMarketPrice?.raw ?? sd.previousClose?.raw ?? 0,
+        peRatio: sd.trailingPE?.raw ?? ks.trailingEps?.raw ?? null,
+        pbRatio: ks.priceToBook?.raw ?? null,
+        grossMargin: fs.grossMargins?.raw ?? null,
+        beta: sd.beta?.raw ?? null,
+        ytdReturn: pr.regularMarketChangePercent?.raw
+          ? null // YTD not in summary, use 52w
+          : ks["52WeekChange"]?.raw ?? null,
+        marketCap: pr.marketCap?.fmt ?? "—",
+        analystRating: fs.recommendationKey
+          ? fs.recommendationKey.toUpperCase().replace(/_/g," ")
+          : "—",
+        priceTarget: fs.targetMeanPrice?.raw ?? null,
+      };
+    } catch { return null; }
+  }));
+  return { peers: results.filter(Boolean) };
+}
+
+// ─── News sentiment via Haiku (only place AI is still needed) ───────
+async function fetchNewsSentiment(ticker) {
+  const prompt = `Search for 5 recent news headlines about ${ticker} stock. Return ONLY JSON:
+{"headlines":[{"title":"...","source":"...","date":"Mar 15","sentiment":0.7,"summary":"brief","tag":"EARNINGS"}],"overallSentiment":0.3,"sentimentLabel":"BULLISH","keyThemes":["a","b"]}
+sentiment -1 to +1. tag: EARNINGS|UPGRADE|DOWNGRADE|MACRO|PRODUCT|LEGAL|GUIDANCE`;
+  const res = await fetch("https://api.anthropic.com/v1/messages", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
-      model: "claude-sonnet-4-20250514",
-      max_tokens: 1000,
+      model: "claude-haiku-4-5-20251001",
+      max_tokens: 700,
       tools: [{ type: "web_search_20250305", name: "web_search" }],
       messages: [{ role: "user", content: prompt }],
     }),
   });
-  const data = await response.json();
-  const textBlock = data.content?.find(b => b.type === "text");
-  if (!textBlock) throw new Error("No text response");
-  let raw = textBlock.text.trim();
-  raw = raw.replace(/```json|```/g, "").trim();
-  const start = raw.indexOf("{"), end = raw.lastIndexOf("}");
-  if (start === -1 || end === -1) throw new Error("No JSON found");
-  return JSON.parse(raw.slice(start, end + 1));
+  const data = await res.json();
+  const blocks = data.content?.filter(b => b.type === "text") || [];
+  if (!blocks.length) throw new Error("No sentiment response");
+  let raw = blocks[blocks.length - 1].text.trim().replace(/```json|```/g, "").trim();
+  const s = raw.indexOf("{"), e = raw.lastIndexOf("}");
+  if (s === -1) throw new Error("No sentiment JSON");
+  return JSON.parse(raw.slice(s, e + 1));
 }
+
 
 // ═══════════════════════════════════════════════════════════════════
 //  UI COMPONENTS
@@ -442,80 +630,71 @@ const FactorRow = ({ label, score, weight, description }) => {
 
 export default function QuantTerminal() {
   const [ticker, setTicker] = useState("NVDA");
-  const [state, setState] = useState({ status: "idle" }); // idle | loading | done | error
+  const [state, setState] = useState({ status: "idle" });
   const [analysis, setAnalysis] = useState(null);
+  const [extras, setExtras] = useState(null); // options, backtest, sentiment, peers
   const [activeTab, setActiveTab] = useState("price");
   const [mcPaths, setMcPaths] = useState(500);
-  const prevTicker = useRef(null);
+  const [optionExpiry, setOptionExpiry] = useState(30);
+  const [optionType, setOptionType] = useState("call");
 
   const runAnalysis = useCallback(async (t, paths) => {
-    setState({ status: "loading", step: "Fetching real market data via web search…" });
+    setState({ status: "loading", step: "Fetching market data…" });
     setAnalysis(null);
+    setExtras({ loading: true });
     try {
-      // 1. Fetch real data
-      const raw = await fetchRealStockData(t);
-      setState({ status: "loading", step: "Fitting GARCH(1,1) volatility model…" });
-      await new Promise(r => setTimeout(r, 50));
+      // ── All network calls fire simultaneously ──────────────────────
+      const [raw, sentimentResult, peersResult] = await Promise.all([
+        fetchRealStockData(t),
+        fetchNewsSentiment(t).catch(e => ({ error: e.message })),
+        fetchPeerComparison(t).catch(e => ({ error: e.message })),
+      ]);
+      setExtras({ loading: false, sentiment: sentimentResult, peers: peersResult });
 
-      const prices = raw.prices.map(Number).filter(Boolean);
-      const dates = raw.dates;
-      const rets = logReturns(prices);
+      setState({ status: "loading", step: "Running quant models…" });
+      await new Promise(r => setTimeout(r, 10));
 
-      // 2. GARCH
-      const garch = fitGARCH(rets);
-      setState({ status: "loading", step: "Running Hidden Markov Model regime detection…" });
-      await new Promise(r => setTimeout(r, 50));
+      const prices = raw.prices.map(Number).filter(v => isFinite(v) && v > 0);
+      const dates  = (raw.dates || []).slice(0, prices.length);
+      const rets   = logReturns(prices);
 
-      // 3. HMM
-      const hmm = fitHMM(rets);
-      setState({ status: "loading", step: `Running ${paths} Monte Carlo paths with GARCH vol…` });
-      await new Promise(r => setTimeout(r, 50));
-
-      // 4. Indicators
-      const rsiVals = computeRSI(prices);
+      const garch       = fitGARCH(rets);
+      const hmm         = fitHMM(rets);
+      const rsiVals     = computeRSI(prices);
       const { macdLine, sigLine, hist: macdHist } = computeMACD(prices);
-      const bbands = bollingerBands(prices);
-      const atrVals = atr(prices);
+      const bbands      = bollingerBands(prices);
+      const atrVals     = atr(prices);
       const garchVolFcast = garchVolForecast(garch, garch.condVar[garch.condVar.length - 1]);
 
-      // 5. GARCH Monte Carlo
+      setState({ status: "loading", step: `Running ${paths} Monte Carlo paths…` });
+      await new Promise(r => setTimeout(r, 10));
+
       const S0 = prices[prices.length - 1];
       const mcAllPaths = garchMonteCarlo(S0, rets, garch, hmm, paths);
-
-      // Percentile bands
       const forecastBands = Array.from({ length: 31 }, (_, i) => {
         const vals = mcAllPaths.map(p => p[i]).sort((a, b) => a - b);
         const n = vals.length;
-        return {
-          day: i,
-          p2: vals[Math.floor(n * 0.02)],
-          p10: vals[Math.floor(n * 0.10)],
-          p25: vals[Math.floor(n * 0.25)],
-          p50: vals[Math.floor(n * 0.50)],
-          p75: vals[Math.floor(n * 0.75)],
-          p90: vals[Math.floor(n * 0.90)],
-          p98: vals[Math.floor(n * 0.98)],
-        };
+        return { day: i, p2: vals[Math.floor(n*.02)], p10: vals[Math.floor(n*.10)], p25: vals[Math.floor(n*.25)], p50: vals[Math.floor(n*.50)], p75: vals[Math.floor(n*.75)], p90: vals[Math.floor(n*.90)], p98: vals[Math.floor(n*.98)] };
       });
 
-      // 6. Risk metrics
-      const risk = riskMetrics(rets, prices);
+      const risk        = riskMetrics(rets, prices);
+      const signal      = calibratedSignal(rets, prices, hmm, garch, rsiVals, bbands);
+      const annSigma    = Math.sqrt(garch.condVar[garch.condVar.length - 1]) * Math.sqrt(252);
+      const optionsChain = buildOptionsChain(S0, annSigma);
+      const backtest    = runBacktest(prices, rets, signal);
 
-      // 7. Multi-factor signal
-      const signal = calibratedSignal(rets, prices, hmm, garch, rsiVals, bbands);
-
-      setAnalysis({ prices, dates, rets, rsiVals, macdLine, sigLine, macdHist, bbands, atrVals, garchVolFcast, forecastBands, mcAllPaths, garch, hmm, risk, signal, S0, meta: raw, paths });
+      setAnalysis({ prices, dates, rets, rsiVals, macdLine, sigLine, macdHist, bbands, atrVals, garchVolFcast, forecastBands, mcAllPaths, garch, hmm, risk, signal, S0, meta: raw, paths, optionsChain, backtest });
       setState({ status: "done" });
+
     } catch (e) {
       setState({ status: "error", message: e.message });
+      setExtras({ loading: false });
     }
   }, []);
 
+  // Run on mount and whenever ticker changes
   useEffect(() => {
-    if (prevTicker.current !== ticker) {
-      prevTicker.current = ticker;
-      runAnalysis(ticker, mcPaths);
-    }
+    runAnalysis(ticker, mcPaths);
   }, [ticker]);
 
   const rerun = () => runAnalysis(ticker, mcPaths);
@@ -562,7 +741,7 @@ export default function QuantTerminal() {
   const regime = analysis?.hmm?.currentState === 0 ? "BULL" : "BEAR";
   const regimeColor = regime === "BULL" ? "#00e8a2" : "#ff4060";
 
-  const TABS = ["price","forecast","volatility","regime","oscillators","signals","risk"];
+  const TABS = ["price","forecast","volatility","regime","oscillators","signals","risk","options","backtest","sentiment","peers"];
 
   return (
     <div style={{ minHeight: "100vh", background: "#04090f", color: "#d0dde8", fontFamily: "'IBM Plex Sans', sans-serif" }}>
@@ -969,9 +1148,257 @@ export default function QuantTerminal() {
               </div>
             )}
 
-            {/* Footer */}
+            {/* ── OPTIONS TAB ── */}
+            {activeTab === "options" && analysis?.optionsChain && (
+              <div>
+                <div style={{ display: "flex", gap: 8, marginBottom: 12, alignItems: "center", flexWrap: "wrap" }}>
+                  <div style={{ fontSize: 9, color: "#1a3550", fontFamily: "monospace", flex: 1 }}>
+                    BLACK-SCHOLES OPTIONS CHAIN · IV = {fmtPct(Math.sqrt(analysis.garch.condVar[analysis.garch.condVar.length-1])*Math.sqrt(252))} (GARCH) · rf = 5.25%
+                  </div>
+                  <div style={{ display: "flex", gap: 4 }}>
+                    {["call","put"].map(t => (
+                      <button key={t} onClick={() => setOptionType(t)} style={{ padding:"3px 12px", fontSize:10, fontFamily:"monospace", border:`1px solid ${optionType===t?"#0a6aff":"#0c1824"}`, background: optionType===t?"#051830":"transparent", color: optionType===t?"#4a9aff":"#2a4560", borderRadius:4, cursor:"pointer", textTransform:"uppercase" }}>{t}</button>
+                    ))}
+                  </div>
+                  <div style={{ display: "flex", gap: 4 }}>
+                    {[7,14,30,60,90].map(d => (
+                      <button key={d} onClick={() => setOptionExpiry(d)} style={{ padding:"3px 10px", fontSize:10, fontFamily:"monospace", border:`1px solid ${optionExpiry===d?"#0a6aff":"#0c1824"}`, background: optionExpiry===d?"#051830":"transparent", color: optionExpiry===d?"#4a9aff":"#2a4560", borderRadius:4, cursor:"pointer" }}>{d}D</button>
+                    ))}
+                  </div>
+                </div>
+                {(() => {
+                  const chain = analysis.optionsChain.find(c => c.expiry === optionExpiry) || analysis.optionsChain[2];
+                  const opt = optionType;
+                  return (
+                    <div>
+                      <div style={{ overflowX: "auto" }}>
+                        <table style={{ width: "100%", borderCollapse: "collapse", fontFamily: "'IBM Plex Mono', monospace", fontSize: 10 }}>
+                          <thead>
+                            <tr style={{ borderBottom: "1px solid #0c1824" }}>
+                              {["Strike","Moneyness","Price","Delta","Gamma","Theta","Vega","Rho","IV"].map(h => (
+                                <th key={h} style={{ padding: "6px 10px", color: "#1a3550", textAlign: "right", fontWeight: 600, letterSpacing: "0.05em", fontSize: 9 }}>{h}</th>
+                              ))}
+                            </tr>
+                          </thead>
+                          <tbody>
+                            {chain.strikes.map((row, i) => {
+                              const o = row[opt];
+                              const atm = Math.abs(row.K - analysis.S0) < analysis.S0 * 0.03;
+                              const itm = opt === "call" ? row.K < analysis.S0 : row.K > analysis.S0;
+                              return (
+                                <tr key={i} style={{ background: atm ? "#0a2040" : itm ? "#060e1a" : "transparent", borderBottom: "1px solid #080f1a" }}>
+                                  <td style={{ padding: "5px 10px", textAlign: "right", color: atm ? "#4a9aff" : "#8899aa", fontWeight: atm ? 700 : 400 }}>${row.K}</td>
+                                  <td style={{ padding: "5px 10px", textAlign: "right", color: parseFloat(row.moneyness) > 0 ? "#00e8a2" : parseFloat(row.moneyness) < 0 ? "#ff4060" : "#f0c040" }}>{row.moneyness}%</td>
+                                  <td style={{ padding: "5px 10px", textAlign: "right", color: "#d0dde8" }}>${o.price.toFixed(2)}</td>
+                                  <td style={{ padding: "5px 10px", textAlign: "right", color: o.delta > 0 ? "#00e8a2" : "#ff4060" }}>{o.delta.toFixed(3)}</td>
+                                  <td style={{ padding: "5px 10px", textAlign: "right", color: "#4a9aff" }}>{o.gamma.toFixed(4)}</td>
+                                  <td style={{ padding: "5px 10px", textAlign: "right", color: "#ff4060" }}>{o.theta.toFixed(3)}</td>
+                                  <td style={{ padding: "5px 10px", textAlign: "right", color: "#f0c040" }}>{o.vega.toFixed(3)}</td>
+                                  <td style={{ padding: "5px 10px", textAlign: "right", color: "#8899aa" }}>{o.rho.toFixed(3)}</td>
+                                  <td style={{ padding: "5px 10px", textAlign: "right", color: "#a070ff" }}>{fmtPct(o.iv)}</td>
+                                </tr>
+                              );
+                            })}
+                          </tbody>
+                        </table>
+                      </div>
+                      {/* Greeks summary for ATM */}
+                      {(() => {
+                        const atm = chain.strikes.reduce((best, r) => Math.abs(r.K - analysis.S0) < Math.abs(best.K - analysis.S0) ? r : best);
+                        const o = atm[opt];
+                        return (
+                          <div style={{ display: "grid", gridTemplateColumns: "repeat(5,1fr)", gap: 6, marginTop: 12 }}>
+                            {[
+                              { label: "ATM Price", value: `$${o.price.toFixed(2)}`, color: "#d0dde8" },
+                              { label: "Delta Δ", value: o.delta.toFixed(3), color: o.delta > 0 ? "#00e8a2" : "#ff4060", sub: "≈ prob ITM" },
+                              { label: "Gamma Γ", value: o.gamma.toFixed(4), color: "#4a9aff", sub: "Δ per $1 move" },
+                              { label: "Theta Θ", value: `$${o.theta.toFixed(3)}/day`, color: "#ff4060", sub: "time decay" },
+                              { label: "Vega ν", value: `$${o.vega.toFixed(3)}/1%`, color: "#f0c040", sub: "vol sensitivity" },
+                            ].map(m => <Chip key={m.label} {...m} />)}
+                          </div>
+                        );
+                      })()}
+                    </div>
+                  );
+                })()}
+              </div>
+            )}
+
+            {/* ── BACKTEST TAB ── */}
+            {activeTab === "backtest" && analysis?.backtest && (() => {
+              const bt = analysis.backtest;
+              return (
+                <div>
+                  <div style={{ fontSize: 9, color: "#1a3550", fontFamily: "monospace", marginBottom: 8 }}>
+                    EMA CROSSOVER STRATEGY (10D/30D) · LONG-ONLY · INITIAL CAPITAL $10,000
+                  </div>
+                  <div style={{ height: 270, background: "#060e1a", borderRadius: 8, border: "1px solid #0c1824", padding: "12px 4px" }}>
+                    <ResponsiveContainer>
+                      <LineChart data={bt.equity}>
+                        <XAxis dataKey="day" tick={{ fill: "#1a3050", fontSize: 8, fontFamily: "monospace" }} tickLine={false} axisLine={false} interval={Math.floor(bt.equity.length/6)} />
+                        <YAxis tick={{ fill: "#1a3050", fontSize: 8, fontFamily: "monospace" }} tickLine={false} axisLine={false} tickFormatter={v => `$${(v/1000).toFixed(1)}k`} domain={["auto","auto"]} />
+                        <Tooltip content={<CustomTooltip />} />
+                        <ReferenceLine y={10000} stroke="#1a2535" strokeDasharray="3 3" />
+                        <Line type="monotone" dataKey="benchmark" stroke="#2a4060" strokeWidth={1.5} dot={false} name="Buy & Hold" />
+                        <Line type="monotone" dataKey="value" stroke="#00e8a2" strokeWidth={2} dot={false} name="Strategy" />
+                      </LineChart>
+                    </ResponsiveContainer>
+                  </div>
+                  <div style={{ display: "grid", gridTemplateColumns: "repeat(4,1fr)", gap: 6, marginTop: 10 }}>
+                    <Chip label="Total Return" value={fmtPct(bt.totalReturn)} color={colorVal(bt.totalReturn)} sub="strategy" />
+                    <Chip label="Benchmark" value={fmtPct(bt.bmReturn)} color={colorVal(bt.bmReturn)} sub="buy & hold" />
+                    <Chip label="Alpha" value={fmtPct(bt.alpha)} color={colorVal(bt.alpha)} sub="vs benchmark" />
+                    <Chip label="Sharpe" value={fmt(bt.sharpe)} color={colorVal(bt.sharpe, 1)} sub="annualized" />
+                    <Chip label="Max Drawdown" value={fmtPct(-bt.maxDD)} color="#ff4060" sub="strategy" />
+                    <Chip label="Ann. Return" value={fmtPct(bt.annRet)} color={colorVal(bt.annRet)} sub="strategy" />
+                    <Chip label="Win Rate" value={fmtPct(bt.winRate)} color={colorVal(bt.winRate, 0.5)} sub={`${bt.nTrades} trades`} />
+                    <Chip label="Ann. Vol" value={fmtPct(bt.annVol)} color="#4a9aff" sub="strategy" />
+                  </div>
+                  <div style={{ marginTop: 10, background: "#060e1a", border: "1px solid #0c1824", borderRadius: 6, padding: "10px 14px", fontSize: 9, color: "#1a3550", fontFamily: "monospace" }}>
+                    Strategy: Buy when 10D EMA crosses above 30D EMA (Golden Cross). Exit when 10D EMA crosses below 30D EMA (Death Cross). Long-only, fully invested when in position, flat (cash) otherwise.
+                  </div>
+                </div>
+              );
+            })()}
+
+            {/* ── SENTIMENT TAB ── */}
+            {activeTab === "sentiment" && (
+              <div>
+                {(!extras || extras.loading) && (
+                  <div style={{ padding: "40px 0", textAlign: "center", fontSize: 10, color: "#0a5adf", fontFamily: "monospace", animation: "pulse 1.4s ease infinite" }}>
+                    Scanning latest news via web search…
+                  </div>
+                )}
+                {extras?.sentiment?.error && (
+                  <div style={{ padding: "20px 0", color: "#ff4060", fontFamily: "monospace", fontSize: 11 }}>✕ {extras.sentiment.error}</div>
+                )}
+                {extras?.sentiment && !extras.sentiment.error && (() => {
+                  const s = extras.sentiment;
+                  const sc = s.overallSentiment;
+                  const scColor = sc > 0.2 ? "#00e8a2" : sc < -0.2 ? "#ff4060" : "#f0c040";
+                  const tagColors = { EARNINGS:"#4a9aff", UPGRADE:"#00e8a2", DOWNGRADE:"#ff4060", MACRO:"#f0c040", PRODUCT:"#a070ff", LEGAL:"#ff8040", INSIDER:"#ff4060", "M&A":"#00c8c8", GUIDANCE:"#4a9aff" };
+                  return (
+                    <div>
+                      <div style={{ display: "flex", gap: 12, marginBottom: 16, alignItems: "center" }}>
+                        <div style={{ padding: "12px 20px", borderRadius: 8, border: `1px solid ${scColor}30`, background: `${scColor}08`, textAlign: "center" }}>
+                          <div style={{ fontSize: 8, color: "#2a4060", fontFamily: "monospace", letterSpacing: "0.12em", marginBottom: 4 }}>OVERALL SENTIMENT</div>
+                          <div style={{ fontSize: 22, fontWeight: 800, color: scColor, fontFamily: "'IBM Plex Mono', monospace" }}>{s.sentimentLabel}</div>
+                          <div style={{ fontSize: 10, color: scColor + "80", fontFamily: "monospace" }}>{sc > 0 ? "+" : ""}{(sc * 100).toFixed(0)} / 100</div>
+                        </div>
+                        <div style={{ flex: 1 }}>
+                          <div style={{ fontSize: 9, color: "#1a3550", fontFamily: "monospace", marginBottom: 6 }}>KEY THEMES</div>
+                          <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+                            {(s.keyThemes || []).map((t, i) => (
+                              <span key={i} style={{ padding: "3px 10px", borderRadius: 3, background: "#0a1a2a", border: "1px solid #1a3050", fontSize: 10, color: "#4a7090", fontFamily: "monospace" }}>{t}</span>
+                            ))}
+                          </div>
+                        </div>
+                      </div>
+                      <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+                        {(s.headlines || []).map((h, i) => {
+                          const c = h.sentiment > 0.2 ? "#00e8a2" : h.sentiment < -0.2 ? "#ff4060" : "#f0c040";
+                          const tagC = tagColors[h.tag] || "#4a7090";
+                          return (
+                            <div key={i} style={{ background: "#060e1a", border: "1px solid #0c1824", borderRadius: 8, padding: "12px 14px", display: "flex", gap: 12 }}>
+                              <div style={{ width: 36, height: 36, borderRadius: "50%", border: `2px solid ${c}`, display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0, background: `${c}08` }}>
+                                <span style={{ fontSize: 11, fontWeight: 700, color: c, fontFamily: "monospace" }}>{h.sentiment > 0 ? "+" : ""}{(h.sentiment * 10).toFixed(0)}</span>
+                              </div>
+                              <div style={{ flex: 1, minWidth: 0 }}>
+                                <div style={{ display: "flex", gap: 6, marginBottom: 4, flexWrap: "wrap" }}>
+                                  <span style={{ fontSize: 8, padding: "1px 6px", borderRadius: 2, background: `${tagC}15`, color: tagC, fontFamily: "monospace", border: `1px solid ${tagC}30` }}>{h.tag}</span>
+                                  <span style={{ fontSize: 8, color: "#1a3550", fontFamily: "monospace" }}>{h.source}</span>
+                                  <span style={{ fontSize: 8, color: "#0a2535", fontFamily: "monospace" }}>{h.date}</span>
+                                </div>
+                                <div style={{ fontSize: 11, color: "#8899aa", marginBottom: 3, lineHeight: 1.4 }}>{h.title}</div>
+                                <div style={{ fontSize: 9, color: "#2a4060", fontFamily: "monospace" }}>{h.summary}</div>
+                              </div>
+                            </div>
+                          );
+                        })}
+                      </div>
+                    </div>
+                  );
+                })()}
+              </div>
+            )}
+
+            {/* ── PEERS TAB ── */}
+            {activeTab === "peers" && (
+              <div>
+                {(!extras || extras.loading) && (
+                  <div style={{ padding: "40px 0", textAlign: "center", fontSize: 10, color: "#0a5adf", fontFamily: "monospace", animation: "pulse 1.4s ease infinite" }}>
+                    Fetching sector peer data via web search…
+                  </div>
+                )}
+                {extras?.peers?.error && (
+                  <div style={{ padding: "20px 0", color: "#ff4060", fontFamily: "monospace", fontSize: 11 }}>✕ {extras.peers.error}</div>
+                )}
+                {extras?.peers?.peers && !extras.peers.error && (() => {
+                  const peers = extras.peers.peers;
+                  const ratingColor = r => ({ "STRONG BUY":"#00e8a2", "BUY":"#4a9aff", "HOLD":"#f0c040", "SELL":"#ff8040", "STRONG SELL":"#ff4060" }[r] || "#8899aa");
+                  const metrics = ["peRatio","pbRatio","grossMargin","beta","ytdReturn"];
+                  const metaLabels = { peRatio:"P/E", pbRatio:"P/B", grossMargin:"Gross Margin", beta:"Beta", ytdReturn:"YTD Ret" };
+                  const isPct = m => m === "ytdReturn" || m === "grossMargin";
+                  return (
+                    <div>
+                      <div style={{ overflowX: "auto", marginBottom: 14 }}>
+                        <table style={{ width: "100%", borderCollapse: "collapse", fontFamily: "'IBM Plex Mono', monospace", fontSize: 10 }}>
+                          <thead>
+                            <tr style={{ borderBottom: "1px solid #0c1824" }}>
+                              {["Ticker","Name","Price","Mkt Cap","Rating","Target",...metrics.map(m => metaLabels[m])].map(h => (
+                                <th key={h} style={{ padding: "6px 10px", color: "#1a3550", textAlign: "right", fontWeight: 600, fontSize: 9, whiteSpace: "nowrap" }}>{h}</th>
+                              ))}
+                            </tr>
+                          </thead>
+                          <tbody>
+                            {peers.map((p, i) => (
+                              <tr key={i} style={{ background: p.ticker === ticker ? "#0a2040" : "transparent", borderBottom: "1px solid #080f1a" }}>
+                                <td style={{ padding: "6px 10px", color: p.ticker === ticker ? "#4a9aff" : "#8899aa", fontWeight: p.ticker === ticker ? 700 : 400 }}>{p.ticker}</td>
+                                <td style={{ padding: "6px 10px", color: "#5a7090", whiteSpace: "nowrap", maxWidth: 120, overflow: "hidden", textOverflow: "ellipsis" }}>{p.name}</td>
+                                <td style={{ padding: "6px 10px", textAlign: "right", color: "#d0dde8" }}>${typeof p.price === "number" ? p.price.toFixed(2) : p.price}</td>
+                                <td style={{ padding: "6px 10px", textAlign: "right", color: "#5a7090" }}>{p.marketCap}</td>
+                                <td style={{ padding: "6px 10px", textAlign: "right", color: ratingColor(p.analystRating), fontSize: 9 }}>{p.analystRating}</td>
+                                <td style={{ padding: "6px 10px", textAlign: "right", color: "#4a9aff" }}>{p.priceTarget ? `$${p.priceTarget}` : "—"}</td>
+                                {metrics.map(m => {
+                                  const v = p[m];
+                                  const display = v == null ? "—" : isPct(m) ? `${(v*100).toFixed(1)}%` : typeof v === "number" ? v.toFixed(2) : v;
+                                  const color = isPct(m) ? colorVal(v) : "#8899aa";
+                                  return <td key={m} style={{ padding: "6px 10px", textAlign: "right", color: color }}>{display}</td>;
+                                })}
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+                      </div>
+                      {/* Visual bar comparison for YTD Return */}
+                      <div style={{ background: "#060e1a", border: "1px solid #0c1824", borderRadius: 8, padding: "14px 16px" }}>
+                        <div style={{ fontSize: 9, color: "#1a3550", fontFamily: "monospace", marginBottom: 12 }}>YTD RETURN COMPARISON</div>
+                        {peers.map((p, i) => {
+                          const v = p.ytdReturn || 0;
+                          const col = v > 0 ? "#00e8a2" : "#ff4060";
+                          const maxAbs = Math.max(...peers.map(x => Math.abs(x.ytdReturn || 0)), 0.01);
+                          return (
+                            <div key={i} style={{ marginBottom: 8 }}>
+                              <div style={{ display: "flex", justifyContent: "space-between", fontSize: 9, fontFamily: "monospace", marginBottom: 3 }}>
+                                <span style={{ color: p.ticker === ticker ? "#4a9aff" : "#3a5070" }}>{p.ticker}</span>
+                                <span style={{ color: col }}>{v > 0 ? "+" : ""}{(v*100).toFixed(1)}%</span>
+                              </div>
+                              <div style={{ height: 4, background: "#0a1520", borderRadius: 2 }}>
+                                <div style={{ height: "100%", width: `${Math.abs(v)/maxAbs*100}%`, background: col, borderRadius: 2, marginLeft: v < 0 ? `${(1-Math.abs(v)/maxAbs)*100}%` : 0, transition: "all 0.5s" }} />
+                              </div>
+                            </div>
+                          );
+                        })}
+                      </div>
+                    </div>
+                  );
+                })()}
+              </div>
+            )}
+
+
             <div style={{ marginTop: 24, paddingTop: 12, borderTop: "1px solid #08121c", fontSize: 8, color: "#0a1e30", fontFamily: "monospace", lineHeight: 1.9 }}>
-              DISCLAIMER: Educational purposes only. Real price data fetched via web search. Models: GARCH(1,1) MLE · 2-State Hidden Markov Model (Baum-Welch EM) · {analysis.paths}-path Monte Carlo · UMD Momentum · RSI(14) · MACD(12,26,9) · Bollinger(20,2) · Half-Kelly · Sharpe · Sortino · Calmar · CVaR95. Not financial advice.
+              DISCLAIMER: Educational purposes only. Real price data fetched via web search. Models: GARCH(1,1) MLE · 2-State HMM (Baum-Welch EM) · {analysis.paths}-path Monte Carlo · UMD Momentum · RSI(14) · MACD(12,26,9) · Bollinger(20,2) · Half-Kelly · Sharpe · Sortino · Calmar · CVaR95 · Black-Scholes (Δ Γ Θ ν ρ) · EMA Crossover Backtest · News Sentiment · Peer Comparison. Not financial advice.
             </div>
           </div>
         )}

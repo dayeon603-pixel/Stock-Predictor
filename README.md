@@ -9,17 +9,17 @@ Overview
 **Alpha Engine v2** is an advanced quant terminal that replicates institutional-grade trading analytics in a single interactive interface.
 
 It combines:
-- 📈 Time-series modeling (GARCH)
-- 🧠 Regime detection (Hidden Markov Models)
-- 🎯 Factor-based alpha signals (momentum, mean reversion, volatility)
-- 🎲 Monte Carlo simulations for price forecasting
-- 🧮 Options pricing (Black-Scholes)
-- 📊 Portfolio backtesting
-- 📰 AI-powered sentiment analysis
+- Time-series modeling (GARCH)
+- Regime detection (Hidden Markov Models)
+- Factor-based alpha signals (momentum, mean reversion, volatility)
+- Monte Carlo simulations for price forecasting
+- Options pricing (Black-Scholes)
+- Portfolio backtesting
+- AI-powered sentiment analysis
 
 ---
 
-## 🧠 Core Quant Models
+## Core Quant Models
 
 ### 1. Volatility Modeling — GARCH(1,1)
 - Conditional volatility estimation
@@ -39,7 +39,7 @@ It combines:
 
 ---
 
-## 📊 Features
+## Features
 
 - Multi-ticker analysis
 - Interactive financial charts
@@ -50,7 +50,7 @@ It combines:
 
 ---
 
-## 🖥️ Tech Stack
+## Tech Stack
 
 - React
 - Recharts
@@ -60,7 +60,7 @@ It combines:
 
 ---
 
-## ⚙️ Installation
+## Installation
 
 ```bash
 git clone https://github.com/yourusername/alpha-engine-v2.git
@@ -71,7 +71,7 @@ npm start
 
 ---
 
-## 📌 Author
+## Author
 
 Dayeon Kang  
 Aspiring Quant / AI Researcher

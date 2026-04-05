@@ -1,4 +1,4 @@
-# Alpha Engine v2 — Quantitative Trading & Analysis Terminal
+# AlphaNexus — Quantitative Trading & Analysis Terminal
 
 > A full-stack quantitative finance platform integrating **GARCH volatility modeling, Hidden Markov Regime Detection, Monte Carlo simulation, and multi-factor alpha signals** into a real-time analytical dashboard.
 
